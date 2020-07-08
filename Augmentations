@@ -1,0 +1,194 @@
+
+# input : 4D numpy: (channel,h,w,d)
+# output: 4D numpy: (channel,h,w,d)
+
+class RandomCropResized3d(object):
+    def __init__(self,crop_size,is_training =True): 
+        """Crop vol to crop_size"""
+        self.is_training = is_training
+        assert isinstance(crop_size, (int, tuple))
+        if isinstance(crop_size, int):
+            self.crop_size = (crop_size, crop_size,crop_size) 
+        else:
+            assert len(crop_size) == 3
+            self.crop_size = crop_size
+    def __call__(self,vol):
+        vol= vol.squeeze()
+        h_old,w_old,d_old = vol.shape[:3]
+        h,w,d = self.crop_size
+        if self.is_training:
+            x = np.random.randint(0,h_old-h)
+            y = np.random.randint(0,w_old-w)
+            z = np.random.randint(0,d_old-d)
+        else:
+            # crop center
+            x = int((h_old - h) / 2)
+            y = int((w_old - w) / 2)
+            z = int((d_old - d) / 2)
+        vol = vol[x:x+h,y:y+w,z:z+d]
+        scale = [h_old*1.0/h, w_old*1.0/w, d_old*1.0/d]
+        vol = ndimage.interpolation.zoom(vol, scale, order=0) 
+        # here we add the channel again
+        return(vol[np.newaxis,...])
+
+
+# Input: 4D numpy array (-,h,w,d,-)
+# Output: 4D numpy array (channel,h,w,d)
+    
+# Fliprate from torchIO
+
+class Flip(object):
+    def __init__(self,flip_rate): 
+        self.flip_rate = flip_rate
+    def __call__(self,vol):
+        
+        if vol.shape[0]!=1:
+            vol= vol.transpose((3,0,1,2))             
+        rnd_flip =  RandomFlip(0,p=self.flip_rate) 
+        return(rnd_flip(vol))
+
+ 
+# TorchIO transforms takes as a sample,4D PyTorch tensors or 4D NumPy arrays 
+
+# Input: 4D numpy array (-,h,w,d,-)
+# Output: 4D numpy array (channel,h,w,d)
+# Here we consider Gaussain Blure
+
+class GaussianBlur(object):
+    def __init__(self,blur_rate,min=0.1,max=2.0): 
+        self.min = min
+        self.max = max
+        self.blur_rate = blur_rate
+    def __call__(self,vol): 
+        if vol.shape[0]!=1:
+            vol= vol.transpose((3,0,1,2)) 
+        GausBlur= torchio.transforms.RandomBlur((self.min,self.max), p=self.blur_rate)    
+        vol = GausBlur(vol) 
+        return(vol)
+
+
+## Input: (-,h,w,d,-)
+## Output: (channel,h,w,d)
+
+AXES = [(2,1),(1,3),(2,3)]
+class Rotation(object):
+    """
+        Perform random uniaxial rotation. rotation axes are choosing at random (1 of the 3 dimensions).
+        Args:
+            std (float): standard dividation used for sampling rotation angles (in degrees). 
+                Rotation angles are sampled from a normal distribution N~(0, std^2)
+            size:...
+        """
+    def __init__(self,std,size=1):
+        self.std = std
+        self.size=size
+    def __call__(self, vol):
+        
+        if vol.shape[0]!=1:
+            vol= vol.transpose((3,0,1,2)) 
+        
+        d = truncnorm.rvs(-1, 1, loc=0, scale=self.std, size=self.size)
+        ax = random.choice(AXES)
+        ax1, ax2 = ax
+        if ax1 > 3 or ax2 > 3:
+            raise NotImplementedError
+        order = 3  # bspline interp
+        vol = ndimage.rotate(vol, d[0], ax, reshape=False, prefilter=True, order=order)
+        
+        return(vol)
+
+## This function is from TorchIO
+# Input : -,h,w,d,-
+# Output: channel, h, w ,d
+
+## ctrl_ptn  can be a triplle or an int
+class RndElsDform(object): 
+    def __init__(self,ctrl_pts): 
+        self.ctrl_pts = ctrl_pts 
+        assert isinstance(self.ctrl_pts,(int,tuple,list))
+        
+        if isinstance(self.ctrl_pts,int):
+            
+            assert self.ctrl_pts >3,"The minimum number of ctrl_pts is 4"
+            
+        if isinstance(self.ctrl_pts,(list,tuple)):
+            assert min(self.ctrl_pts)>3,"The minimum number of ctrl_pts is 4"
+        
+    def __call__(self,vol):
+        
+        if vol.shape[0]!=1:
+            vol= vol.transpose((3,0,1,2)) 
+            
+        rndels = RandomElasticDeformation(num_control_points=self.ctrl_pts,locked_borders=0)
+        return(rndels(vol))
+    
+
+# Input:  h,w,d,channel or channel,h,w,d  ---> so first we trnasform the channel to last
+# Output: h,w,d,channel
+
+class AdjustContrast(object):
+    """
+    Randomly changes image intensity by gamma. Each pixel/voxel intensity is updated as::
+        x = ((x - min) / intensity_range) ^ gamma * intensity_range + min
+    Args:
+        prob: Probability of adjustment.
+        gamma (tuple of float or float): Range of gamma values.
+            If single number, value is picked from (0.5, gamma), default is (0.5, 4.5).
+    """
+    def __init__(self, gamma=(0.5, 4.5)):
+        self.gamma: Tuple[float, float]
+        if not isinstance(gamma, (tuple, list)):
+            
+            assert gamma > 0.5, "if gamma is single number, must greater than 0.5 and value is picked from (0.5, gamma)"
+            self.gamma = (0.5, gamma) 
+        else:
+            assert len(gamma) == 2, "gamma should be a number or pair of numbers."
+            self.gamma = (gamma[0], gamma[1])
+    def __call__(self, vol):
+        """
+        Apply the transform to `img`.
+        """
+        if vol.shape[0]==1:
+            vol= vol.transpose((1,2,3,0))   
+        epsilon = 1e-7
+        vol_min = vol.min()
+        vol_range = vol.max() - vol_min
+        vol = np.power(((vol - vol_min) / float(vol_range + epsilon)), self.gamma) * vol_range + vol_min
+        
+        # here we remove the channel and add the new channel at dim=1
+        vol = np.expand_dims(vol[:,:,:,1],0)
+        return(vol)     
+
+
+class Normalize(object):
+    def __init__(self):  
+        pass
+    def __call__(self,vol):
+        vol = (vol-vol.mean())/vol.std()
+        return(vol)       
+
+# This class is doing pairwise agunmentation 
+class PairwiseAg(object):
+    def __init__(self, transform):
+        self.transform = transform
+    def __call__(self, vol): 
+        voli = self.transform(vol)
+        volj = self.transform(vol)
+        return(voli,volj)
+
+def get_transform(crop_size,flip_rate,std,ctrl_pts,gamma,blur_rate,phase):
+    
+    if phase=='train':
+    
+        transform = transforms.Compose([RandomCropResized3d(crop_size),
+                                        Flip(flip_rate),
+                                        Rotation(std),
+                                        RndElsDform(ctrl_pts),
+                                        AdjustContrast(gamma),
+                                        GaussianBlur(blur_rate),
+                                        Normalize()])
+    else:
+        # we do not apply any augmentation on test set
+        transform = Normalize()
+    return(transform)
+
